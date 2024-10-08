@@ -4,6 +4,9 @@
 - [Release Signoff Checklist](#release-signoff-checklist)
 - [Summary](#summary)
 - [Motivation](#motivation)
+  - [SR-IOV partitioned devices](#sr-iov-partitioned-devices)
+    - [Intel GPUs](#intel-gpus)
+    - [Intel QAT:](#intel-qat)
   - [Goals](#goals)
   - [Non-Goals](#non-goals)
 - [Proposal](#proposal)
@@ -11,6 +14,9 @@
   - [Extending a device with as set of mixins](#extending-a-device-with-as-set-of-mixins)
   - [Defining device partitions in terms of consumed capacity in a composite device](#defining-device-partitions-in-terms-of-consumed-capacity-in-a-composite-device)
   - [Putting it all together for the MIG use-case](#putting-it-all-together-for-the-mig-use-case)
+  - [SR-IOV use cases](#sr-iov-use-cases)
+    - [GPU](#gpu)
+    - [QAT](#qat)
   - [Test Plan](#test-plan)
       - [Prerequisite testing updates](#prerequisite-testing-updates)
       - [Unit tests](#unit-tests)
@@ -43,10 +49,10 @@ Items marked with (R) are required *prior to targeting to a milestone / release*
 - [x] (R) Design details are appropriately documented
 - [ ] (R) Test plan is in place, giving consideration to SIG Architecture and SIG Testing input (including test refactors)
   - [ ] e2e Tests for all Beta API Operations (endpoints)
-  - [ ] (R) Ensure GA e2e tests meet requirements for [Conformance Tests](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/conformance-tests.md) 
+  - [ ] (R) Ensure GA e2e tests meet requirements for [Conformance Tests](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/conformance-tests.md)
   - [ ] (R) Minimum Two Week Window for GA e2e tests to prove flake free
 - [ ] (R) Graduation criteria is in place
-  - [ ] (R) [all GA Endpoints](https://github.com/kubernetes/community/pull/1806) must be hit by [Conformance Tests](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/conformance-tests.md) 
+  - [ ] (R) [all GA Endpoints](https://github.com/kubernetes/community/pull/1806) must be hit by [Conformance Tests](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/conformance-tests.md)
 - [x] (R) Production readiness review completed
 - [x] (R) Production readiness review approved
 - [x] "Implementation History" section is up-to-date for milestone
@@ -222,7 +228,76 @@ done *after* the scheduler has allocated these devices, keeping the GPU free to
 be partitioned in different ways until the actual user-workload requesting them
 has been submitted.
 
-With his motivating example in mind. We define the following goals and
+### SR-IOV partitioned devices
+
+[Single Root Input / Output Virtualization](https://en.wikipedia.org/wiki/Single-root_input/output_virtualization)
+is a PCIe feature allowing isolation of underlying HW resources.
+
+Until recently, SR-IOV configuration of the hardware in Kubernetes cluster had to
+be set statically by a cluster administrator or node startup automation, or
+semi-manually, for instance by an SR-IOV operator that would read the needed
+target SR-IOV configuration from an API object or a config file.
+
+Like the [summary](#summary) describes, "classic" DRA allowed leveraging SR-IOV
+dynamically by allowing DRA driver's kubelet-plugin to change SR-IOV configuration
+of the underlying device, part of which was allocated to the ResourceClaim.
+
+Similar to the [MIG devices](#mig-devices), SR-IOV VFs allow using part of the
+physical device. A VF has a profile associated with it, which determines the amount
+of particular hardware device property provided to the VF.
+
+The difference from the MIG devices is how device configuration is applied: it can
+only be done once. When there are 0 VFs on a physical device, it is possible to
+configure and enable a number of VFs. Once it's done, it's impossible to increase
+or decrease (unless down to zero) the number of VFs enabled, it's only possible to disable
+all of the VFs. Afterwards it's back to square one and a new SR-IOV configuration
+can be applied with a number of VFs enabled.
+
+This effectively requires deciding how the whole device resources are split when
+even fraction was requested in s form of a single VF.
+
+From K8s perspective this means that the initial allocation of a VF(s) will determine
+how the rest of the device resources can be allocated through sub-devices in ResourceSlice.
+
+#### Intel GPUs
+
+The main resource represented as capacity and split into chunks with SR-IOV VFs
+is local memory. Consider a GPU that has 16Gi of memory and can have up to 16 VFs.
+```
++-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+|                                             GPU0                                              |
++-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+|                                              16Gi                                             |
++-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+|                      8Gi                      |                      8Gi                      |
++-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+|          4Gi          |          4Gi          |          4Gi          |          4Gi          |
++-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+|    2 Gi   |    2 Gi   |    2 Gi   |    2 Gi   |    2 Gi   |    2 Gi   |    2 Gi   |    2 Gi   |
++-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+| 1Gi | 1Gi | 1Gi | 1Gi | 1Gi | 1Gi | 1Gi | 1Gi | 1Gi | 1Gi | 1Gi | 1Gi | 1Gi | 1Gi | 1Gi | 1Gi |
++-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+```
+
+The GPU DRA resource driver can announce the GPU device and all of the VFs in 5
+different sizes available for allocation.
+
+When the first VFs is allocated, the SR-IOV configuration has to be applied, and
+we don't want any resources unutilized, so all of the resources have to be split
+into VFs.
+
+While the configuration can be heterogeneous, for example 1 x 8Gi-VF + 2 x 4Gi-VF,
+it is impossible to predict what exact resources would be requested in future
+so it only makes sense to use VFs of the same profile to at least allow scaling
+of the workload that got the initially allocated VF.
+
+#### Intel QAT:
+
+The QAT device can serve two out of three or four (depending on model) supported
+cryptography functions at a time. Once the pair of available features was chosen,
+all of the VFs will be effectively in the same mode until new configuration replaces it.
+
+With these motivating examples in mind. We define the following goals and
 non-goals of this KEP.
 
 ### Goals
@@ -1647,6 +1722,579 @@ devices:
     - name: memory-slices-0-7
 ```
 
+### SR-IOV use cases
+
+#### GPU
+```yaml
+devices:
+- name: gpu-0
+  composite:
+    attributes:
+      type:
+        string: "gpu"
+    capacity:
+      vfs:
+        quantity: "16"
+      memory:
+        quantity: 16Gi
+- name: gpu-0-all-1Gi-vfs
+  composite:
+    attributes:
+      type:
+        string: "gpumode"
+    capacity:
+      vfs:
+        quantity: "16"
+      memory:
+        quantity: 16Gi
+    consumesCapacityFrom:
+    - name: gpu-0
+- name: gpu-0-all-2Gi-vfs
+  composite:
+    attributes:
+      type:
+        string: "gpumode"
+    capacity:
+      vfs:
+        quantity: "16"
+      memory:
+        quantity: 16Gi
+    consumesCapacityFrom:
+    - name: gpu-0
+- name: gpu-0-all-4Gi-vfs
+  composite:
+    attributes:
+      type:
+        string: "gpumode"
+    capacity:
+      vfs:
+        quantity: "16"
+      memory:
+        quantity: 16Gi
+    consumesCapacityFrom:
+    - name: gpu-0
+- name: gpu-0-all-8Gi-vfs
+  composite:
+    attributes:
+      type:
+        string: "gpumode"
+    capacity:
+      vfs:
+        quantity: "16"
+      memory:
+        quantity: 16Gi
+    consumesCapacityFrom:
+    - name: gpu-0
+- name: gpu-0-all-16Gi-vfs
+  composite:
+    attributes:
+      type:
+        string: "gpumode"
+    capacity:
+      vfs:
+        quantity: "16"
+      memory:
+        quantity: 16Gi
+    consumesCapacityFrom:
+    - name: gpu-0
+- name: gpu-0-1Gi-vf0
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 1Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-1Gi-vfs
+- name: gpu-0-1Gi-vf1
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 1Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-1Gi-vfs
+- name: gpu-0-1Gi-vf2
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 1Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-1Gi-vfs
+- name: gpu-0-1Gi-vf3
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 1Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-1Gi-vfs
+- name: gpu-0-1Gi-vf4
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 1Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-1Gi-vfs
+- name: gpu-0-1Gi-vf5
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 1Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-1Gi-vfs
+- name: gpu-0-1Gi-vf6
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 1Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-1Gi-vfs
+- name: gpu-0-1Gi-vf7
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 1Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-1Gi-vfs
+- name: gpu-0-2Gi-vf0
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 2Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-2Gi-vfs
+- name: gpu-0-2Gi-vf1
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 2Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-2Gi-vfs
+- name: gpu-0-2Gi-vf2
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 2Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-2Gi-vfs
+- name: gpu-0-2Gi-vf3
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 2Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-2Gi-vfs
+- name: gpu-0-2Gi-vf4
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 2Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-2Gi-vfs
+- name: gpu-0-2Gi-vf5
+  composite:
+    attributes:
+      type:
+        string: "vf"`qat-0-ac-vf1`
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 2Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-2Gi-vfs
+- name: gpu-0-2Gi-vf6
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 2Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-2Gi-vfs
+- name: gpu-0-2Gi-vf7
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 2Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-2Gi-vfs
+
+- name: gpu-0-4Gi-vf0
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 4Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-4Gi-vfs
+- name: gpu-0-4Gi-vf1
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 4Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-4Gi-vfs
+- name: gpu-0-4Gi-vf2
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 4Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-4Gi-vfs
+- name: gpu-0-4Gi-vf3
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 4Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-4Gi-vfs
+- name: gpu-0-8Gi-vf0
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 8Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-8Gi-vfs
+- name: gpu-0-8Gi-vf1
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 8Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-8Gi-vfs
+- name: gpu-0-16Gi-vf0
+  composite:
+    attributes:
+      type:
+        string: "vf"
+    capacity:
+      vfs:
+        quantity: "1"
+      memory:
+        quantity: 16Gi
+    consumesCapacityFrom:
+    - name: gpu-0-all-16Gi-vfs
+```
+
+In this example a GPU `gpu-0` has 16Gi of memory and can have up to 16 VFs of the
+same size. There are "intermediate" consuming devices with attribute "type" set to
+"gpumode" to indicate that it should not be requested. Such intermediate device
+can consume all of the capacity from source `gpu-0` when the first allocation of
+a VF has to restrict further choice of the devices available on source device.
+
+The ResourceClaim, for example, can have request for a device with attribute
+"type" == "vf", and attribute "memory" == "4Gi". There are only 4 such devices
+and all of them consume 1 VF and 4 Gi of memory capacity from the same intermediate
+device. When such a VF, for example `gpu-0-4Gi-vf0`, is allocated - it consumes
+4Gi or memory and a single VF from device `gpu-0-all-4Gi-vfs`, the latter in turn
+has consumed all of the memory and VFs from `gpu-0` making it impossible to allocate
+anything else from `gpu-0` and the only allocations that could be done now are the
+devices that consume from `gpu-0-all-4Gi-vfs`.
+
+#### QAT
+
+```yaml
+devices:
+- name: qat-0
+  composite:
+    attributes:
+      type:
+        string: "qat"
+    capacity:
+      vfs:
+        quantity: "4"
+- name: qat-0-ab-mode
+  composite:
+    attributes:
+      type:
+        string: "qatmode"
+    capacity:
+      vfs:
+        quantity: "4"
+    consumesCapacityFrom:
+    - name: qat-0
+- name: qat-0-bc-mode
+  composite:
+    attributes:
+      type:
+        string: "qatmode"
+    capacity:
+      vfs:
+        quantity: "4"
+    consumesCapacityFrom:
+    - name: qat-0
+- name: qat-0-ac-mode
+  composite:
+    attributes:
+      type:
+        string: "qatmode"
+    capacity:
+      vfs:
+        quantity: "4"
+    consumesCapacityFrom:
+    - name: qat-0
+- name: qat-0-ab-vf0
+  composite:
+    attributes:
+      type:
+        string: "vf"
+      mode:
+        string: "ab"
+    capacity:
+      vfs:
+        quantity: "1"
+  consumesCapacityFrom:
+    - name: qat-0-ab-mode
+- name: qat-0-ab-vf1
+  composite:
+    attributes:
+      type:
+        string: "vf"
+      mode:
+        string: "ab"
+    capacity:
+      vfs:
+        quantity: "1"
+  consumesCapacityFrom:
+    - name: qat-0-ab-mode
+- name: qat-0-ab-vf2
+  composite:
+    attributes:
+      type:
+        string: "vf"
+      mode:
+        string: "ab"
+    capacity:
+      vfs:
+        quantity: "1"
+  consumesCapacityFrom:
+    - name: qat-0-ab-mode
+- name: qat-0-ab-vf3
+  composite:
+    attributes:
+      type:
+        string: "vf"
+      mode:
+        string: "ab"
+    capacity:
+      vfs:
+        quantity: "1"
+  consumesCapacityFrom:
+    - name: qat-0-ab-mode
+- name: qat-0-bc-vf0
+  composite:
+    attributes:
+      type:
+        string: "vf"
+      mode:
+        string: "bc"
+    capacity:
+      vfs:
+        quantity: "1"
+  consumesCapacityFrom:
+    - name: qat-0-bc-mode
+- name: qat-0-bc-vf1
+  composite:
+    attributes:
+      type:
+        string: "vf"
+      mode:
+        string: "bc"
+    capacity:
+      vfs:
+        quantity: "1"
+  consumesCapacityFrom:
+    - name: qat-0-bc-mode
+- name: qat-0-bc-vf2
+  composite:
+    attributes:
+      type:
+        string: "vf"
+      mode:
+        string: "bc"
+    capacity:
+      vfs:
+        quantity: "1"
+  consumesCapacityFrom:
+    - name: qat-0-bc-mode
+- name: qat-0-bc-vf3
+  composite:
+    attributes:
+      type:
+        string: "vf"
+      mode:
+        string: "bc"
+    capacity:
+      vfs:
+        quantity: "1"
+  consumesCapacityFrom:
+    - name: qat-0-bc-mode
+- name: qat-0-ac-vf0
+  composite:
+    attributes:
+      type:
+        string: "vf"
+      mode:
+        string: "ac"
+    capacity:
+      vfs:
+        quantity: "1"
+  consumesCapacityFrom:
+    - name: qat-0-ac-mode
+- name: qat-0-ac-vf1
+  composite:
+    attributes:
+      type:
+        string: "vf"
+      mode:
+        string: "ac"
+    capacity:
+      vfs:
+        quantity: "1"
+  consumesCapacityFrom:
+    - name: qat-0-ac-mode
+- name: qat-0-ac-vf2
+  composite:
+    attributes:
+      type:
+        string: "vf"
+      mode:
+        string: "ac"
+    capacity:
+      vfs:
+        quantity: "1"
+  consumesCapacityFrom:
+    - name: qat-0-ac-mode
+- name: qat-0-ac-vf3
+  composite:
+    attributes:
+      type:
+        string: "vf"
+      mode:
+        string: "ac"
+    capacity:
+      vfs:
+        quantity: "1"
+  consumesCapacityFrom:
+    - name: qat-0-ac-mode
+```
+
+In this example there is a QuickAssistTechnilogy (QAT) device `qat-0` that can have up
+to 4 VFs with the same two cryptographic functions out of three totally available.
+Once two functions are selected - all of the VFs will have the same functions.
+
+When the ResourceClaim requests a QAT VF device with, for example, functions b + c
+(attribute "type" == "vf", attribute "mode" == "bc"), then then first allocated
+device will only allow `qat-0` to have VFs with same functions b + c.
+
+This can be achieved with intermediate device that consumes all of the source
+device capacity, and only has devices with with same mode attribute value consuming
+capacity from it. `qat-0-ac-mode`, `qat-0-ab-mode` and `qat-0-bc-mode` are such devices.
+
+Let's say, the scheduler allocated `qat-0-ac-vf1` device. It consumes 1 VF from
+`qat-0-ac-mode`, which in turn has consumed all of 4 VFs capacity from `qat-0`,
+and the only allocations left possible are `qat-0-ac-vf0`, `qat-0-ac-vf2`, `qat-0-ac-vf3`.
+
 ### Test Plan
 
 <!--
@@ -1868,10 +2516,10 @@ and operation of this feature.
 Recall that end users cannot usually observe component logs or access metrics.
 
 - [ ] Events
-  - Event Reason: 
+  - Event Reason:
 - [ ] API .status
-  - Condition name: 
-  - Other field: 
+  - Condition name:
+  - Other field:
 - [ ] Other (treat as last resort)
   - Details:
 -->
